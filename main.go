@@ -93,6 +93,13 @@ func checkCDN(target string) bool {
 	return false
 }
 
+// DNS解析配置
+const (
+	maxRetries     = 3
+	dnsTimeout     = 5 * time.Second
+	concurrentLimit = 20
+)
+
 // 域名转IP
 func domain2ip2cdn(url string) Result {
 	// 清理URL
@@ -114,29 +121,52 @@ func domain2ip2cdn(url string) Result {
 
 	// 配置DNS解析器
 	client := new(dns.Client)
-	client.Timeout = 2 * time.Second
+	client.Timeout = dnsTimeout
 
 	// 尝试解析A记录
 	m := new(dns.Msg)
 	m.SetQuestion(url+".", dns.TypeA)
-	r, _, err := client.Exchange(m, "223.5.5.5:53")
-	if err == nil && len(r.Answer) > 0 {
-		for _, ans := range r.Answer {
-			if a, ok := ans.(*dns.A); ok {
-				ip := a.A.String()
-				if isValidIPv4(ip) {
-					if checkCDN(url) {
-						log.Printf("发现CDN: %s", url)
-						return Result{URL: url, Result: "cdn"}
+	
+	// 使用多个DNS服务器
+	dnsServers := []string{
+		"223.5.5.5:53",     // 阿里DNS
+		"114.114.114.114:53", // 114DNS
+	}
+
+	var lastErr error
+	for _, server := range dnsServers {
+		for retry := 0; retry < maxRetries; retry++ {
+			r, _, err := client.Exchange(m, server)
+			if err != nil {
+				lastErr = err
+				time.Sleep(time.Second) // 重试前等待
+				continue
+			}
+
+			if len(r.Answer) > 0 {
+				for _, ans := range r.Answer {
+					if a, ok := ans.(*dns.A); ok {
+						ip := a.A.String()
+						if isValidIPv4(ip) {
+							if checkCDN(url) {
+								log.Printf("发现CDN: %s", url)
+								return Result{URL: url, Result: "cdn"}
+							}
+							log.Printf("成功解析IP: %s -> %s -> %s", url, ip, server)
+							return Result{URL: url, Result: ip}
+						}
 					}
-					log.Printf("成功解析IP: %s -> %s -> dns", url, ip)
-					return Result{URL: url, Result: ip}
 				}
 			}
+			break // 如果解析成功但没有结果，尝试下一个DNS服务器
 		}
 	}
 
-	log.Printf("解析失败: %s", url)
+	if lastErr != nil {
+		log.Printf("解析失败: %s, 错误: %v", url, lastErr)
+	} else {
+		log.Printf("解析失败: %s, 无A记录", url)
+	}
 	return Result{URL: url, Result: "failed"}
 }
 
@@ -235,7 +265,7 @@ func main() {
 	)
 
 	// 使用信号量控制并发
-	sem := semaphore.NewWeighted(10)
+	sem := semaphore.NewWeighted(concurrentLimit)
 	var wg sync.WaitGroup
 	results := make(chan Result, len(urls))
 	ipList := make(map[string]bool)
@@ -258,7 +288,10 @@ func main() {
 			wg.Add(1)
 			go func(url string) {
 				defer wg.Done()
-				sem.Acquire(context.Background(), 1)
+				if err := sem.Acquire(context.Background(), 1); err != nil {
+					log.Printf("获取信号量失败: %v", err)
+					return
+				}
 				defer sem.Release(1)
 				results <- domain2ip2cdn(url)
 				bar.Add(1) // 更新进度条
