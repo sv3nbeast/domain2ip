@@ -90,6 +90,21 @@ func checkCDN(target string) bool {
 		return true
 	}
 
+	// 检查CNAME记录
+	m = new(dns.Msg)
+	m.SetQuestion(target+".", dns.TypeCNAME)
+	r, _, err = client.Exchange(m, "8.8.8.8:53")
+	if err == nil && len(r.Answer) > 0 {
+		for _, ans := range r.Answer {
+			if cname, ok := ans.(*dns.CNAME); ok {
+				if isCDNDomain(cname.Target) {
+					log.Printf("域名 %s 的CNAME %s 包含CDN关键词,判定为CDN", target, cname.Target)
+					return true
+				}
+			}
+		}
+	}
+
 	return false
 }
 
